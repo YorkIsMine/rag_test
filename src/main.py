@@ -3,11 +3,12 @@ RAG Pipeline — продвинутый механизм индексации д
 
 Использование:
     python src/main.py index <docs_path> [--strategy fixed|structural|both]
-    python src/main.py search <query> [--top_k 5]
+    python src/main.py search <query> [--top_k 5] [--rerank] [--rewrite] [--threshold 0.3]
     python src/main.py chat [--top_k 5]
     python src/main.py agent
     python src/main.py dual <query> [--top_k 5]
     python src/main.py compare <docs_path>
+    python src/main.py compare_modes <query> [--top_k 5] [--threshold 0.3]
 """
 
 from __future__ import annotations
@@ -24,9 +25,14 @@ from chunking import chunk_fixed, chunk_structural
 from embeddings import get_embeddings, get_client
 from index_store import save_index, load_index, search
 from compare import compare_strategies, print_comparison
+from reranker import rerank_pipeline, rewrite_query, filter_by_threshold
 
 CHAT_MODEL = "gpt-4o"
 RAG_INDEX_DIRS = ("rag_index_fixed", "rag_index_structural")
+
+# Настройки по умолчанию
+DEFAULT_THRESHOLD = 0.3
+DEFAULT_FETCH_K = 20  # сколько достаём из индекса ДО фильтрации
 
 
 
@@ -68,29 +74,55 @@ def cmd_index(args: argparse.Namespace) -> None:
 
 
 def cmd_search(args: argparse.Namespace) -> None:
-    """Поиск по обоим индексам, результаты объединяются и ранжируются по score."""
-    top_results = _retrieve(args.query, top_k=args.top_k)
+    """Поиск по обоим индексам с опциональным реранкингом и фильтрацией."""
+    use_enhanced = args.rerank or args.rewrite or args.threshold > 0
+
+    if use_enhanced:
+        print(f"Запрос: {args.query}")
+        print(f"Режим: enhanced (rewrite={args.rewrite}, rerank={args.rerank}, "
+              f"threshold={args.threshold}, fetch_k={args.fetch_k})\n")
+        top_results, stats = _retrieve_enhanced(
+            args.query,
+            top_k=args.top_k,
+            use_rewrite=args.rewrite,
+            use_reranker=args.rerank,
+            threshold=args.threshold,
+            fetch_k=args.fetch_k,
+            verbose=True,
+        )
+        print()
+    else:
+        top_results = _retrieve(args.query, top_k=args.top_k)
+        stats = None
+        print(f"Запрос: {args.query}\n")
 
     if not top_results:
-        print("Индексы не найдены. Сначала запустите: python src/main.py index <docs_path>")
+        print("Результатов не найдено.")
         return
 
-    print(f"Запрос: {args.query}\n")
     for i, r in enumerate(top_results, 1):
-        score = r.pop("score")
-        text = r.pop("text")
-        print(f"--- Результат {i} (score: {score:.4f}) ---")
+        score = r.get("score", 0)
+        text = r.get("text", "")
+        llm_rel = r.get("llm_relevance")
+        reason = r.get("rerank_reason", "")
+
+        score_str = f"score: {score:.4f}"
+        if llm_rel is not None:
+            score_str += f", relevance: {llm_rel}/10"
+
+        print(f"--- Результат {i} ({score_str}) ---")
         print(f"  Источник: {r.get('filename', '?')}")
         print(f"  Секция:   {r.get('section', '?')}")
         print(f"  Стратегия: {r.get('strategy', '?')}")
-        print(f"  Chunk ID: {r.get('chunk_id', '?')}")
+        if reason:
+            print(f"  Причина:  {reason}")
         preview = text[:300].replace("\n", " ")
         print(f"  Текст:    {preview}{'...' if len(text) > 300 else ''}")
         print()
 
 
 def _retrieve(query: str, top_k: int = 5) -> list[dict]:
-    """Поиск по обоим индексам, возвращает top_k результатов."""
+    """Базовый поиск по обоим индексам, возвращает top_k результатов (без фильтрации)."""
     query_emb = get_embeddings([query])
     all_results: list[dict] = []
 
@@ -106,6 +138,62 @@ def _retrieve(query: str, top_k: int = 5) -> list[dict]:
     return all_results[:top_k]
 
 
+def _retrieve_enhanced(
+    query: str,
+    top_k: int = 5,
+    *,
+    use_rewrite: bool = False,
+    use_reranker: bool = True,
+    threshold: float = DEFAULT_THRESHOLD,
+    fetch_k: int = DEFAULT_FETCH_K,
+    verbose: bool = False,
+) -> tuple[list[dict], dict]:
+    """
+    Улучшенный поиск: query rewrite → расширенная выборка → threshold → LLM rerank.
+
+    Возвращает (результаты, статистика).
+    """
+    stats: dict = {"original_query": query}
+
+    # Шаг 0: Query rewrite
+    if use_rewrite:
+        rewritten = rewrite_query(query)
+        stats["rewritten_query"] = rewritten
+        if verbose:
+            print(f"  Rewrite: {query!r} → {rewritten!r}")
+        search_query = rewritten
+    else:
+        search_query = query
+
+    # Шаг 1: Широкая выборка (fetch_k > top_k)
+    raw_results = _retrieve(search_query, top_k=fetch_k)
+    stats["fetched"] = len(raw_results)
+
+    if verbose and raw_results:
+        scores = [r["score"] for r in raw_results]
+        print(f"  Fetch: {len(raw_results)} результатов, "
+              f"score: {max(scores):.4f} .. {min(scores):.4f}")
+
+    # Шаг 2: Threshold + Rerank
+    final, pipeline_stats = rerank_pipeline(
+        query,  # для реранкинга используем оригинальный запрос
+        raw_results,
+        threshold=threshold,
+        top_k=top_k,
+        use_reranker=use_reranker,
+    )
+    stats.update(pipeline_stats)
+
+    if verbose:
+        print(f"  Threshold ({threshold}): {pipeline_stats['before_filter']} → "
+              f"{pipeline_stats['after_threshold']} "
+              f"(отсечено: {pipeline_stats['removed_by_threshold']})")
+        if use_reranker:
+            print(f"  Rerank: → {pipeline_stats['after_rerank']} результатов")
+
+    return final, stats
+
+
 def _has_rag_index() -> bool:
     for idx_dir in RAG_INDEX_DIRS:
         try:
@@ -116,8 +204,26 @@ def _has_rag_index() -> bool:
     return False
 
 
-def _build_rag_context(query: str, top_k: int) -> tuple[str, list[str]]:
-    results = _retrieve(query, top_k=top_k)
+def _build_rag_context(
+    query: str,
+    top_k: int,
+    *,
+    use_rewrite: bool = False,
+    use_reranker: bool = False,
+    threshold: float = 0.0,
+) -> tuple[str, list[str]]:
+    use_enhanced = use_rewrite or use_reranker or threshold > 0
+
+    if use_enhanced:
+        results, _ = _retrieve_enhanced(
+            query, top_k=top_k,
+            use_rewrite=use_rewrite,
+            use_reranker=use_reranker,
+            threshold=threshold,
+        )
+    else:
+        results = _retrieve(query, top_k=top_k)
+
     if not results:
         return "(контекст не найден)", []
 
@@ -294,6 +400,102 @@ def cmd_agent(args: argparse.Namespace) -> None:
         print(f"\nБот: {answer}\n")
 
 
+def cmd_compare_modes(args: argparse.Namespace) -> None:
+    """Сравнение режимов поиска: baseline vs enhanced (rewrite + rerank + threshold)."""
+    if not _has_rag_index():
+        print("Индексы не найдены. Сначала: python src/main.py index <docs_path>")
+        return
+
+    query = args.query
+    top_k = args.top_k
+    threshold = args.threshold
+
+    print(f"{'=' * 70}")
+    print(f"СРАВНЕНИЕ РЕЖИМОВ ПОИСКА")
+    print(f"Запрос: {query}")
+    print(f"top_k={top_k}, threshold={threshold}")
+    print(f"{'=' * 70}\n")
+
+    # Режим 1: Baseline (без фильтрации)
+    print(">>> РЕЖИМ 1: Baseline (без фильтрации и реранкинга)")
+    print("-" * 50)
+    baseline = _retrieve(query, top_k=top_k)
+    _print_results_compact(baseline, label="baseline")
+
+    # Режим 2: Только threshold
+    print("\n>>> РЕЖИМ 2: Threshold filter (порог отсечения)")
+    print("-" * 50)
+    raw = _retrieve(query, top_k=DEFAULT_FETCH_K)
+    filtered = filter_by_threshold(raw, threshold=threshold)
+    filtered = filtered[:top_k]
+    print(f"  Из {len(raw)} результатов после threshold={threshold}: {len(filtered)}")
+    _print_results_compact(filtered, label="threshold")
+
+    # Режим 3: Threshold + Rerank
+    print("\n>>> РЕЖИМ 3: Threshold + LLM Rerank")
+    print("-" * 50)
+    reranked, stats = _retrieve_enhanced(
+        query, top_k=top_k,
+        use_rewrite=False, use_reranker=True,
+        threshold=threshold, verbose=True,
+    )
+    _print_results_compact(reranked, label="rerank", show_relevance=True)
+
+    # Режим 4: Query Rewrite + Threshold + Rerank
+    print("\n>>> РЕЖИМ 4: Query Rewrite + Threshold + LLM Rerank")
+    print("-" * 50)
+    full, full_stats = _retrieve_enhanced(
+        query, top_k=top_k,
+        use_rewrite=True, use_reranker=True,
+        threshold=threshold, verbose=True,
+    )
+    _print_results_compact(full, label="full", show_relevance=True)
+
+    # Сводная таблица
+    print(f"\n{'=' * 70}")
+    print("СВОДКА")
+    print(f"{'=' * 70}")
+    modes = [
+        ("Baseline", baseline),
+        ("Threshold", filtered),
+        ("Threshold+Rerank", reranked),
+        ("Rewrite+Threshold+Rerank", full),
+    ]
+    print(f"{'Режим':<30} {'Кол-во':>8} {'Avg score':>10} {'Min score':>10} {'Max score':>10}")
+    print("-" * 70)
+    for name, results in modes:
+        if results:
+            scores = [r["score"] for r in results]
+            avg_s = sum(scores) / len(scores)
+            print(f"{name:<30} {len(results):>8} {avg_s:>10.4f} {min(scores):>10.4f} {max(scores):>10.4f}")
+        else:
+            print(f"{name:<30} {'0':>8} {'—':>10} {'—':>10} {'—':>10}")
+
+
+def _print_results_compact(
+    results: list[dict],
+    label: str = "",
+    show_relevance: bool = False,
+) -> None:
+    """Компактный вывод результатов для сравнения."""
+    if not results:
+        print("  (нет результатов)")
+        return
+
+    for i, r in enumerate(results, 1):
+        score = r.get("score", 0)
+        llm_rel = r.get("llm_relevance")
+        section = r.get("section", "?")
+        strategy = r.get("strategy", "?")
+        text_preview = r.get("text", "")[:100].replace("\n", " ")
+
+        line = f"  {i}. [{score:.4f}]"
+        if show_relevance and llm_rel is not None:
+            line += f" [rel:{llm_rel}/10]"
+        line += f" [{strategy}] {section}: {text_preview}..."
+        print(line)
+
+
 def cmd_compare(args: argparse.Namespace) -> None:
     """Сравнение стратегий чанкинга."""
     print(f"Загрузка документов из: {args.docs_path}")
@@ -336,7 +538,15 @@ def main() -> None:
     # search
     p_search = sub.add_parser("search", help="Поиск по обоим индексам")
     p_search.add_argument("query", help="Поисковый запрос")
-    p_search.add_argument("--top_k", type=int, default=5, help="Кол-во результатов")
+    p_search.add_argument("--top_k", type=int, default=5, help="Кол-во результатов (после фильтрации)")
+    p_search.add_argument("--fetch_k", type=int, default=DEFAULT_FETCH_K,
+                          help="Кол-во результатов ДО фильтрации (default: 20)")
+    p_search.add_argument("--threshold", type=float, default=0.0,
+                          help="Порог отсечения по score (default: 0 — выключен)")
+    p_search.add_argument("--rerank", action="store_true",
+                          help="Включить LLM-реранкинг")
+    p_search.add_argument("--rewrite", action="store_true",
+                          help="Включить query rewriting")
 
     # chat
     p_chat = sub.add_parser("chat", help="Диалог с ботом + RAG-контекст")
@@ -349,6 +559,13 @@ def main() -> None:
     p_dual = sub.add_parser("dual", help="Один запрос -> два ответа: с RAG и без RAG")
     p_dual.add_argument("query", help="Запрос к модели")
     p_dual.add_argument("--top_k", type=int, default=5, help="Кол-во чанков контекста для RAG")
+
+    # compare_modes
+    p_cm = sub.add_parser("compare_modes", help="Сравнение режимов: baseline vs rerank vs rewrite")
+    p_cm.add_argument("query", help="Поисковый запрос для сравнения")
+    p_cm.add_argument("--top_k", type=int, default=5, help="Кол-во результатов")
+    p_cm.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD,
+                      help=f"Порог отсечения (default: {DEFAULT_THRESHOLD})")
 
     # compare
     p_compare = sub.add_parser("compare", help="Сравнение стратегий чанкинга")
@@ -371,6 +588,8 @@ def main() -> None:
         cmd_agent(args)
     elif args.command == "dual":
         cmd_dual(args)
+    elif args.command == "compare_modes":
+        cmd_compare_modes(args)
     elif args.command == "compare":
         cmd_compare(args)
 
