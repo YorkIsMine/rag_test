@@ -21,13 +21,20 @@ def get_client() -> OpenAI:
     return OpenAI(api_key=api_key)
 
 
+def _sanitize_for_api(text: str) -> str:
+    """Убирает сурогатные символы перед отправкой в API."""
+    import re
+    text = re.sub(r'[\ud800-\udfff]', '', text)
+    return text.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
+
+
 def get_embeddings(texts: list[str]) -> np.ndarray:
     """Получить эмбеддинги для списка текстов. Возвращает нормализованный numpy array."""
     client = get_client()
     all_embeddings: list[list[float]] = []
 
     for i in range(0, len(texts), BATCH_SIZE):
-        batch = texts[i : i + BATCH_SIZE]
+        batch = [_sanitize_for_api(t) for t in texts[i : i + BATCH_SIZE]]
         response = client.embeddings.create(model=EMBEDDING_MODEL, input=batch)
         all_embeddings.extend(item.embedding for item in response.data)
 

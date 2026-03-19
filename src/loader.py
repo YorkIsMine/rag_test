@@ -18,11 +18,21 @@ class Document:
     metadata: dict = field(default_factory=dict)
 
 
+def _sanitize_text(text: str) -> str:
+    """Убирает сурогатные символы, которые ломают UTF-8 сериализацию."""
+    # Сначала убираем все сурогатные code-points (\uD800-\uDFFF)
+    import re
+    text = re.sub(r'[\ud800-\udfff]', '\ufffd', text)
+    # Затем прогоняем через encode/decode для гарантии чистого UTF-8
+    return text.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
+
+
 def load_pdf(path: Path) -> str:
     reader = PdfReader(str(path))
     pages = []
     for i, page in enumerate(reader.pages):
         text = page.extract_text() or ""
+        text = _sanitize_text(text)
         if text.strip():
             pages.append(text)
     return "\n\n".join(pages)

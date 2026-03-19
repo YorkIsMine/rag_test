@@ -20,6 +20,8 @@ import os
 # Добавляем src в path для импортов
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import re
+
 from loader import load_documents
 from chunking import chunk_fixed, chunk_structural
 from embeddings import get_embeddings, get_client
@@ -27,12 +29,49 @@ from index_store import save_index, load_index, search
 from compare import compare_strategies, print_comparison
 from reranker import rerank_pipeline, rewrite_query, filter_by_threshold
 
+
+def _clean_input(text: str) -> str:
+    """Убирает сурогатные символы из пользовательского ввода (проблема локали терминала)."""
+    # Убираем сурогатные code-points U+D800..U+DFFF
+    text = re.sub(r'[\ud800-\udfff]', '', text)
+    return text.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
+
 CHAT_MODEL = "gpt-4o"
 RAG_INDEX_DIRS = ("rag_index_fixed", "rag_index_structural")
 
 # Настройки по умолчанию
 DEFAULT_THRESHOLD = 0.3
 DEFAULT_FETCH_K = 20  # сколько достаём из индекса ДО фильтрации
+RELEVANCE_FLOOR = 0.35  # ниже этого порога — модель обязана сказать "не знаю"
+
+
+RAG_SYSTEM_PROMPT = """\
+Ты — помощник, отвечающий на вопросы СТРОГО на основе предоставленного контекста из базы знаний.
+
+ОБЯЗАТЕЛЬНЫЙ ФОРМАТ ОТВЕТА:
+
+**Ответ:**
+<твой ответ на вопрос, основанный только на контексте>
+
+**Источники:**
+- <source> | <section> | <chunk_id>
+- ...
+
+**Цитаты:**
+- «<точная цитата из контекста, подтверждающая ответ>» — <source>, <section>
+- ...
+
+ПРАВИЛА:
+1. Каждый ответ ОБЯЗАН содержать все три секции: Ответ, Источники и Цитаты.
+2. Цитаты — это ДОСЛОВНЫЕ фрагменты из предоставленного контекста (в кавычках «»).
+3. Каждая цитата должна подтверждать часть ответа.
+4. Если контекст предоставлен, ты ОБЯЗАН попытаться ответить на его основе. Даже если информация неполная — дай ответ на основе того, что есть, и укажи что информация может быть неполной.
+5. Говори «не знаю» ТОЛЬКО если предоставленный контекст АБСОЛЮТНО не связан с вопросом. В этом случае ответь:
+   **Ответ:** К сожалению, в доступной базе знаний недостаточно информации для ответа на этот вопрос. Пожалуйста, уточните запрос или переформулируйте вопрос.
+   **Источники:** нет релевантных
+   **Цитаты:** нет релевантных
+6. Отвечай на том же языке, на котором задан вопрос.
+"""
 
 
 
@@ -210,8 +249,15 @@ def _build_rag_context(
     *,
     use_rewrite: bool = False,
     use_reranker: bool = False,
-    threshold: float = 0.0,
-) -> tuple[str, list[str]]:
+    threshold: float = DEFAULT_THRESHOLD,
+) -> tuple[str, list[dict], float]:
+    """
+    Возвращает (context_text, chunk_details, max_score).
+
+    chunk_details — список словарей с полями:
+        source, section, chunk_id, score, snippet (первые 200 символов текста).
+    max_score — максимальный score среди найденных чанков (0.0 если пусто).
+    """
     use_enhanced = use_rewrite or use_reranker or threshold > 0
 
     if use_enhanced:
@@ -225,17 +271,43 @@ def _build_rag_context(
         results = _retrieve(query, top_k=top_k)
 
     if not results:
-        return "(контекст не найден)", []
+        return "(контекст не найден)", [], 0.0
+
+    max_score = max(r.get("score", 0) for r in results)
 
     context_parts: list[str] = []
-    sources: list[str] = []
-    for r in results:
-        context_parts.append(r["text"])
+    chunk_details: list[dict] = []
+    for i, r in enumerate(results, 1):
         source = r.get("filename", "?")
         section = r.get("section", "")
-        sources.append(f"{source} ({section})")
+        chunk_id = r.get("chunk_id", f"chunk_{i}")
+        score = r.get("score", 0)
+        text = r["text"]
 
-    return "\n\n---\n\n".join(context_parts), sources
+        # Контекст для модели — с метаданными, чтобы модель могла ссылаться
+        context_parts.append(
+            f"[Источник: {source} | Секция: {section} | ID: {chunk_id}]\n{text}"
+        )
+        chunk_details.append({
+            "source": source,
+            "section": section,
+            "chunk_id": chunk_id,
+            "score": score,
+            "snippet": text[:200].strip(),
+        })
+
+    return "\n\n---\n\n".join(context_parts), chunk_details, max_score
+
+
+def _format_low_relevance_response() -> str:
+    """Ответ при низкой релевантности контекста."""
+    return (
+        "**Ответ:** К сожалению, в доступной базе знаний недостаточно информации "
+        "для ответа на этот вопрос. Пожалуйста, уточните запрос или "
+        "переформулируйте вопрос.\n\n"
+        "**Источники:** нет релевантных\n\n"
+        "**Цитаты:** нет релевантных"
+    )
 
 
 def cmd_chat(args: argparse.Namespace) -> None:
@@ -252,7 +324,7 @@ def cmd_chat(args: argparse.Namespace) -> None:
 
     while True:
         try:
-            question = input("Вы: ").strip()
+            question = _clean_input(input("Вы: ").strip())
         except (EOFError, KeyboardInterrupt):
             print("\nДо свидания!")
             break
@@ -263,18 +335,21 @@ def cmd_chat(args: argparse.Namespace) -> None:
             print("До свидания!")
             break
 
-        context, sources = _build_rag_context(question, top_k=args.top_k)
-
-        system_msg = (
-            "Ты — помощник, отвечающий на вопросы на основе предоставленного контекста из базы знаний. "
-            "Отвечай точно и по существу. Если в контексте нет информации для ответа — честно скажи об этом. "
-            "Отвечай на том же языке, на котором задан вопрос."
+        context, chunk_details, max_score = _build_rag_context(
+            question, top_k=args.top_k, threshold=DEFAULT_THRESHOLD,
         )
+
+        # Режим "не знаю": если лучший результат ниже порога релевантности
+        if max_score < RELEVANCE_FLOOR or not chunk_details:
+            answer = _format_low_relevance_response()
+            print(f"\nБот (релевантность {max_score:.4f} < {RELEVANCE_FLOOR}):\n{answer}\n")
+            history.append({"role": "user", "content": question})
+            history.append({"role": "assistant", "content": answer})
+            continue
 
         user_msg = f"Контекст из базы знаний:\n\n{context}\n\n---\n\nВопрос: {question}"
 
-        # Формируем сообщения: system + история + текущий вопрос с контекстом
-        messages = [{"role": "system", "content": system_msg}]
+        messages = [{"role": "system", "content": RAG_SYSTEM_PROMPT}]
         messages.extend(history)
         messages.append({"role": "user", "content": user_msg})
 
@@ -294,42 +369,45 @@ def cmd_chat(args: argparse.Namespace) -> None:
         if len(history) > 20:
             history = history[-20:]
 
-        print(f"\nБот: {answer}")
-        if sources:
-            print(f"\n  Источники: {', '.join(dict.fromkeys(sources))}")
+        print(f"\nБот:\n{answer}")
+        # Показываем детали чанков для прозрачности
+        print(f"\n  [Найдено чанков: {len(chunk_details)}, "
+              f"макс. score: {max_score:.4f}]")
         print()
 
 
 def cmd_dual(args: argparse.Namespace) -> None:
     """Один запрос -> два ответа: с RAG и без RAG."""
     client = get_client()
-    question = args.query
+    question = _clean_input(args.query)
 
     print(f"Запрос: {question}\n")
 
     if _has_rag_index():
-        context, sources = _build_rag_context(question, top_k=args.top_k)
-        rag_system_msg = (
-            "Ты — помощник, отвечающий на вопросы на основе предоставленного контекста из базы знаний. "
-            "Отвечай точно и по существу. Если в контексте нет информации для ответа — честно скажи об этом. "
-            "Отвечай на том же языке, на котором задан вопрос."
+        context, chunk_details, max_score = _build_rag_context(
+            question, top_k=args.top_k, threshold=DEFAULT_THRESHOLD,
         )
-        rag_user_msg = f"Контекст из базы знаний:\n\n{context}\n\n---\n\nВопрос: {question}"
-        rag_response = client.chat.completions.create(
-            model=CHAT_MODEL,
-            messages=[
-                {"role": "system", "content": rag_system_msg},
-                {"role": "user", "content": rag_user_msg},
-            ],
-            temperature=0.3,
-        )
-        rag_answer = rag_response.choices[0].message.content
+
+        if max_score < RELEVANCE_FLOOR or not chunk_details:
+            rag_answer = _format_low_relevance_response()
+        else:
+            rag_user_msg = f"Контекст из базы знаний:\n\n{context}\n\n---\n\nВопрос: {question}"
+            rag_response = client.chat.completions.create(
+                model=CHAT_MODEL,
+                messages=[
+                    {"role": "system", "content": RAG_SYSTEM_PROMPT},
+                    {"role": "user", "content": rag_user_msg},
+                ],
+                temperature=0.3,
+            )
+            rag_answer = rag_response.choices[0].message.content
     else:
         rag_answer = (
             "RAG-ответ недоступен: индексы не найдены. "
             "Сначала запустите: python src/main.py index <docs_path>"
         )
-        sources = []
+        chunk_details = []
+        max_score = 0.0
 
     plain_system_msg = (
         "Ты — помощник. Отвечай точно и по существу. "
@@ -348,8 +426,8 @@ def cmd_dual(args: argparse.Namespace) -> None:
 
     print("=== Ответ с RAG ===")
     print(rag_answer)
-    if sources:
-        print(f"\nИсточники: {', '.join(dict.fromkeys(sources))}")
+    if chunk_details:
+        print(f"\n  [Чанков: {len(chunk_details)}, макс. score: {max_score:.4f}]")
     print("\n=== Ответ без RAG ===")
     print(plain_answer)
 
@@ -363,7 +441,7 @@ def cmd_agent(args: argparse.Namespace) -> None:
 
     while True:
         try:
-            question = input("Вы: ").strip()
+            question = _clean_input(input("Вы: ").strip())
         except (EOFError, KeyboardInterrupt):
             print("\nДо свидания!")
             break
