@@ -5,6 +5,7 @@ RAG Pipeline — продвинутый механизм индексации д
     python src/main.py index <docs_path> [--strategy fixed|structural|both]
     python src/main.py search <query> [--top_k 5] [--rerank] [--rewrite] [--threshold 0.3]
     python src/main.py chat [--top_k 5]
+    python src/main.py smart_chat [--top_k 5]    # RAG + память задачи
     python src/main.py agent
     python src/main.py dual <query> [--top_k 5]
     python src/main.py compare <docs_path>
@@ -28,6 +29,7 @@ from embeddings import get_embeddings, get_client
 from index_store import save_index, load_index, search
 from compare import compare_strategies, print_comparison
 from reranker import rerank_pipeline, rewrite_query, filter_by_threshold
+from smart_chat import run_smart_chat
 
 
 def _clean_input(text: str) -> str:
@@ -630,6 +632,12 @@ def main() -> None:
     p_chat = sub.add_parser("chat", help="Диалог с ботом + RAG-контекст")
     p_chat.add_argument("--top_k", type=int, default=5, help="Кол-во чанков контекста")
 
+    # smart_chat (RAG + task state)
+    p_smart = sub.add_parser("smart_chat", help="RAG-чат с памятью задачи и источниками")
+    p_smart.add_argument("--top_k", type=int, default=5, help="Кол-во чанков контекста")
+    p_smart.add_argument("--fast", action="store_true",
+                         help="Быстрый режим (gpt-4o-mini, без LLM-реранкинга)")
+
     # agent (без RAG)
     sub.add_parser("agent", help="Диалог с агентом без RAG-контекста")
 
@@ -662,6 +670,8 @@ def main() -> None:
         cmd_search(args)
     elif args.command == "chat":
         cmd_chat(args)
+    elif args.command == "smart_chat":
+        run_smart_chat(top_k=args.top_k, fast=args.fast)
     elif args.command == "agent":
         cmd_agent(args)
     elif args.command == "dual":
